@@ -4,20 +4,18 @@ import java.io.OutputStreamWriter
 import java.net.{ HttpURLConnection, URL }
 
 import com.amazonaws.auth.EnvironmentVariableCredentialsProvider
-import com.amazonaws.services.s3.transfer.TransferManager
 import com.amazonaws.util.IOUtils
-import com.github.dwhjames.awswrap.s3.AmazonS3ScalaClient
-
+import com.github.dwhjames.awswrap.s3.FutureTransfer
 import im.actor.api.rpc._
 import im.actor.api.rpc.files._
-import im.actor.server.{ ImplicitFileStorageAdapter, BaseAppSuite }
-import im.actor.server.api.rpc.RpcApiService
 import im.actor.server.api.rpc.service.files.FilesServiceImpl
 import im.actor.server.oauth.{ GoogleProvider, OAuth2GoogleConfig }
-import im.actor.server.presences.{ GroupPresenceManager, PresenceManager }
-import im.actor.server.push.{ SeqUpdatesManager, WeakUpdatesManager }
-import im.actor.server.session.{ SessionConfig, Session }
+import im.actor.server.session.Session
 import im.actor.server.social.SocialManager
+import im.actor.server.util.FileUtils._
+import im.actor.server.{ BaseAppSuite, ImplicitFileStorageAdapter }
+
+import scala.concurrent.Await
 
 class FilesServiceSpec extends BaseAppSuite with ImplicitFileStorageAdapter {
   behavior of "FilesService"
@@ -31,6 +29,8 @@ class FilesServiceSpec extends BaseAppSuite with ImplicitFileStorageAdapter {
   it should "Generate valid download urls" in e4
 
   it should "Generate valid upload part urls when same request comes twice" in e5
+
+  it should "Process CommitFileUpload in reasonable amount of time" in e6
 
   implicit val sessionRegion = Session.startRegionProxy()
 
@@ -153,4 +153,53 @@ class FilesServiceSpec extends BaseAppSuite with ImplicitFileStorageAdapter {
     }
   }
 
+  def e6() = {
+    import scala.concurrent.duration._
+
+    //6,25 Mb
+    val partsCount = 200
+    val partSize = 1024 * 32
+
+    val uploadKey = whenReady(service.handleGetFileUploadUrl(partSize * partsCount)) { resp ⇒
+      resp should matchPattern { case Ok(ResponseGetFileUploadUrl(url, _)) ⇒ }
+      resp.toOption.get.uploadKey
+    }
+
+    val urls = (1 to partsCount) map { i ⇒
+      whenReady(service.handleGetFileUploadPartUrl(i, partSize, uploadKey)) { resp ⇒
+        resp should matchPattern {
+          case Ok(ResponseGetFileUploadPartUrl(_)) ⇒
+        }
+        resp.toOption.get.url
+      }
+    }
+
+    val parts = urls map { urlStr ⇒
+      val url = new URL(urlStr)
+      val connection = url.openConnection().asInstanceOf[HttpURLConnection]
+      connection.setDoOutput(true)
+      connection.setRequestMethod("PUT")
+      connection.addRequestProperty("Content-Type", "application/octet-stream")
+      val out = new OutputStreamWriter(connection.getOutputStream)
+      val partContents = "." * partSize
+      out.write(partContents)
+      out.close()
+      val responseCode = connection.getResponseCode()
+      responseCode shouldEqual 200
+      partContents
+    }
+    val s3Key = new String(uploadKey)
+    within(20.seconds) {
+      Await.ready(for {
+        tempDir ← createTempDir()
+        _ ← FutureTransfer.listenFor {
+          fsAdapter.transferManager.downloadDirectory(fsAdapter.bucketName, s"upload_part_$s3Key", tempDir)
+        } map (_.waitForCompletion())
+      } yield (), Duration.Inf)
+    }
+
+    //    within(25.seconds) {
+    //      Await.result(service.handleCommitFileUpload(uploadKey, "The.File"), Duration.Inf)
+    //    }
+  }
 }
